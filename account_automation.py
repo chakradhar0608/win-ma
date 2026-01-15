@@ -164,7 +164,7 @@ async def process_account(browser, account, selectors):
         await page.goto(selectors["website"], wait_until="domcontentloaded", timeout=60000)
         title = await page.title()
         print(f"[{username}] Page Title: {title}", flush=True)
-        if not page_title:
+        if not title:
             # If title is empty, we are blocked. Throw error to trigger retry.
             raise Exception("BLOCKED: Generated empty page title.")
         # 3. Login
