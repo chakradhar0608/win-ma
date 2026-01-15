@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import json
+import random
 import os
 from datetime import datetime
 from playwright.async_api import async_playwright
