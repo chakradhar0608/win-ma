@@ -19,13 +19,23 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      # 1. NEW: Check for cached browsers
+      - name: Cache Playwright Browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/requirements.txt') }}
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Create Accounts File
         run: echo "${{ secrets.ACCOUNTS_CSV }}" > accounts.csv
 
+      # 2. MODIFIED: Install only if cache miss
       - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: playwright install chromium
 
       - name: Run script (UNBUFFERED)
