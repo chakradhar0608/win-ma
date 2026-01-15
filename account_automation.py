@@ -133,8 +133,18 @@ async def process_account(browser, account, selectors):
     # 1. Setup Context with Real User Agent (Bypasses basic bot detection)
     context = await browser.new_context(
         viewport={"width": 1920, "height": 1080},
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        java_script_enabled=True,
+        locale="en-IN",              # 1. Set Locale to India
+        timezone_id="Asia/Kolkata",  # 2. Set Timezone to IST
+        geolocation={"latitude": 17.3850, "longitude": 78.4867}, # 3. Set GPS (Hyderabad)
+        permissions=["geolocation"]  # Allow site to see the fake location
     )
+    await context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+    """)
     
     # Block heavy resources to speed up loading
     async def block_resources(route):
@@ -244,7 +254,9 @@ async def worker(worker_id, queue, browser, selectors):
             return
 
         username = account["username"]
-
+        delay = (worker_id * 5) + random.uniform(1, 10)
+        print(f"[Worker {worker_id}] Sleeping {delay:.2f}s before starting {username}...", flush=True)
+        await asyncio.sleep(delay)
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 print(f"[Worker {worker_id}] {username} | Attempt {attempt}", flush=True)
@@ -298,6 +310,7 @@ async def main():
                 "--disable-accelerated-2d-canvas",
                 "--no-zygote",
                 "--start-maximized"
+                "--disable-blink-features=AutomationControlled"
             ]
         )
         tasks = [asyncio.create_task(worker(i, queue, browser, selectors)) for i in range(MAX_WORKERS)]
