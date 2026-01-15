@@ -6,7 +6,7 @@ from datetime import datetime
 from playwright.async_api import async_playwright
 
 # ================= CONFIG =================
-MAX_WORKERS = 5
+MAX_WORKERS = 1
 MAX_RETRIES = 20
 
 ACCOUNTS_FILE = "accounts.csv"
@@ -74,6 +74,10 @@ async def save_result(row):
 
 # ================= POPUP HANDLING =================
 async def dismiss_overlays(page, username):
+    """
+    Dismiss overlays that may block clicks using JavaScript and known selectors.
+    """
+    # Overlays to remove via JS
     overlay_identifiers = [
         "strEchApp_ovrlay",
         "aviatrix-container_overlay",
@@ -86,12 +90,38 @@ async def dismiss_overlays(page, username):
 
     for identifier in overlay_identifiers:
         try:
-            await page.evaluate(f"""
-                () => {{
-                    document.getElementById('{identifier}')?.remove();
-                    [...document.getElementsByClassName('{identifier}')].forEach(e => e.remove());
-                }}
-            """)
+            await page.evaluate(f"""() => {{
+                // Remove by Class
+                const els = document.getElementsByClassName('{identifier}');
+                for (let i = els.length - 1; i >= 0; i--) els[i].remove();
+                
+                // Remove by ID
+                const el = document.getElementById('{identifier}');
+                if (el) el.remove();
+            }}""")
+        except:
+            pass
+
+    # Aggressive close button clicking
+    close_patterns = [
+        "button.animCLseBtn",
+        "button.mnPopupClose",
+        ".popup-close",
+        ".modal-close",
+        "button[aria-label='Close']",
+        "[class*='close']",
+        # Specifics
+        "#app-next > div.mb-app > div.aviatrix-container_overlay:nth-of-type(22) > div.aviatrix-container > button.animCLseBtn:nth-of-type(1) > span",
+        "#app-next > div.mb-app:nth-of-type(1) > div.mainPopupWrpr.mainPopupWrpr_pgsoft:nth-of-type(20) > div.mnPopupCtntPar > button.mnPopupBtn.mnPopupClose.pgSoftClsBtn:nth-of-type(2)"
+    ]
+
+    for selector in close_patterns:
+        try:
+            # Try to click if visible, short timeout
+            loc = page.locator(selector).first
+            if await loc.is_visible():
+                await loc.click(timeout=2000)
+                await asyncio.sleep(0.5)
         except:
             pass
 
@@ -113,6 +143,9 @@ async def process_account(browser, account, selectors):
         await page.press(selectors["password_field"], "Enter")
 
         await page.wait_for_load_state("networkidle", timeout=6000000)
+        
+        await asyncio.sleep(2)
+        await dismiss_overlays(page, username)
 
         bal_loc = page.locator(selectors["avaliable_balance"])
         await bal_loc.wait_for(state="visible", timeout=6000000)
@@ -187,7 +220,7 @@ async def main():
         queue.put_nowait(acc)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=False)
         tasks = [asyncio.create_task(worker(i, queue, browser, selectors)) for i in range(MAX_WORKERS)]
         await asyncio.gather(*tasks)
         await browser.close()
