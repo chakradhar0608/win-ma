@@ -6,8 +6,8 @@ from datetime import datetime
 from playwright.async_api import async_playwright
 
 # ================= CONFIG =================
-MAX_WORKERS = 10
-MAX_RETRIES = 20
+MAX_WORKERS = 1
+MAX_RETRIES = 3
 
 ACCOUNTS_FILE = "accounts.csv"
 RESULTS_FILE = "account_balances.csv"
@@ -130,64 +130,99 @@ async def process_account(browser, account, selectors):
     username = account["username"]
     password = account["password"]
 
-    # In process_account function
+    # 1. Setup Context with Real User Agent (Bypasses basic bot detection)
     context = await browser.new_context(
         viewport={"width": 1920, "height": 1080},
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
     
-    # Block non-essential resources for faster loading
+    # Block heavy resources to speed up loading
     async def block_resources(route):
-        resource_type = route.request.resource_type
-        if resource_type in ["image", "stylesheet", "font", "media", "imageset"]:
+        if route.request.resource_type in ["image", "media", "font"]:
             await route.abort()
         else:
             await route.continue_()
-    
+            
     await context.route("**/*", block_resources)
     page = await context.new_page()
 
     try:
+        # 2. Navigate
         print(f"[{username}] Navigating...", flush=True)
+        # Reduced timeout to 60s so it doesn't hang forever
         await page.goto(selectors["website"], wait_until="domcontentloaded", timeout=60000)
+        
+        # 3. Login
+        print(f"[{username}] Logging in...", flush=True)
+        # Attempt to dismiss pre-login popups
         await dismiss_overlays(page, username)
-        page_title = await page.title()
-        print(f"[{username}] Page Title: {page_title}", flush=True)
-        print(f"[{username}] Logging in...", flush=True) # ADDED LOG
-        try:
-            await page.click(selectors["landing_page_login_button"], timeout=60000)
-        except Exception as e:
-            print(f"[{username}] Login button not found! Taking screenshot...", flush=True)
-            # Make sure the 'screenshots' directory exists
-            os.makedirs("screenshots", exist_ok=True) 
-            await page.screenshot(path=f"screenshots/error_{username}.png")
-            raise e
+        
+        await page.click(selectors["landing_page_login_button"])
         await page.fill(selectors["username_field"], username)
         await page.fill(selectors["password_field"], password)
         await page.press(selectors["password_field"], "Enter")
 
-        #await page.wait_for_load_state("networkidle", timeout=60000)
+        # 4. Wait for Page Load (Fixed 5s wait is safer than networkidle here)
+        print(f"[{username}] Login submitted. Waiting 10s for page to settle...", flush=True)
+        await asyncio.sleep(10)
+
+        # 5. SOLUTION 1: The "Ghost Read" Loop
+        # We try to read the text even if a popup is covering it.
+        print(f"[{username}] Attempting to read balance (Ghost Read)...", flush=True)
         
-        await asyncio.sleep(2)
-        await dismiss_overlays(page, username)
-        print(f"[{username}] Waiting for balance element...", flush=True)
         bal_loc = page.locator(selectors["avaliable_balance"])
-        await bal_loc.wait_for(state="visible", timeout=6000000)
+        
+        # Try 10 times (approx 20 seconds)
+        for i in range(10):
+            try:
+                # OPTIONAL: Blind click to center of screen to close generic overlays
+                if i == 0: 
+                    try:
+                        await page.mouse.click(960, 540) # Center of 1920x1080
+                    except: pass
 
-        for _ in range(10):
-            text = (await bal_loc.inner_text()).strip()
-            if any(c.isdigit() for c in text):
-                print(f"[{username}] Balance detected: {text}", flush=True)
-                return {
-                    "username": username,
-                    "password": password,
-                    "balance": text,
-                    "status": "Success",
-                    "error": "",
-                }
-            await asyncio.sleep(1.5)
+                # Use text_content() because it works even if element is hidden/covered
+                raw_text = await bal_loc.text_content(timeout=1000)
+                
+                if raw_text:
+                    clean_text = raw_text.strip()
+                    # Check if it looks like a number
+                    if any(c.isdigit() for c in clean_text):
+                        print(f"[{username}] SUCCESS: Balance found: {clean_text}", flush=True)
+                        return {
+                            "username": username,
+                            "password": password,
+                            "balance": clean_text,
+                            "status": "Success",
+                            "error": "",
+                        }
+            except Exception:
+                # Ignore minor errors during the loop
+                pass
+            
+            await asyncio.sleep(2)
 
-        raise Exception("Balance not found")
+        # 6. SOLUTION 2: HTML Dump (If Ghost Read failed)
+        # If we reach here, we couldn't find the balance.
+        print(f"[{username}] FAILED: Balance not found. Dumping HTML for debugging...", flush=True)
+        
+        # Create output directories if they don't exist
+        os.makedirs("debug_html", exist_ok=True)
+        os.makedirs("screenshots", exist_ok=True)
+
+        # Save Screenshot
+        await page.screenshot(path=f"screenshots/failed_{username}.png")
+        
+        # Save HTML Source Code (This helps you find the popup ID)
+        html_content = await page.content()
+        with open(f"debug_html/failed_{username}.html", "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+        raise Exception("Balance not found (Check debug_html folder)")
+
+    except Exception as e:
+        # Re-raise the exception so the worker logs it as a failure
+        raise e
 
     finally:
         await context.close()
