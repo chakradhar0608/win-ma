@@ -3,7 +3,7 @@ name: Playwright Automation
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # Runs every 6 hours
+    - cron: '0 */6 * * *'
 
 jobs:
   run:
@@ -17,49 +17,32 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip' # Enable built-in pip caching
+          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Create Accounts File
-        run: |
-          echo "${{ secrets.ACCOUNTS_CSV }}" > accounts.csv
-        shell: bash
-
-      - name: Cache Playwright browsers
-        id: playwright-cache
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+        run: echo "${{ secrets.ACCOUNTS_CSV }}" > accounts.csv
 
       - name: Install Playwright browsers
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: playwright install chromium
 
-      - name: Run script
+      - name: Run script (UNBUFFERED)
+        env:
+          PYTHONUNBUFFERED: 1
         run: |
-          python account_automation.py
-
-      - name: Send results to Telegram
-        if: always()
-        run: |
-          if [ -f "account_balances.csv" ]; then
-            curl -s -F document=@account_balances.csv "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendDocument?chat_id=${{ secrets.TELEGRAM_TO }}"
-          else
-            echo "account_balances.csv not found, skipping Telegram upload."
-          fi
+          set -x
+          python -u account_automation.py
 
       - name: Upload results
-        if: always() # Upload even if script fails
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: results
           path: |
             account_balances.csv
             progress.json
-          retention-days: 90
 
       - name: Upload screenshots
         if: always()
@@ -67,4 +50,3 @@ jobs:
         with:
           name: screenshots
           path: screenshots/
-          retention-days: 90

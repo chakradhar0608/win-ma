@@ -17,6 +17,31 @@ SELECTORS_FILE = "selectors.json"
 
 csv_lock = asyncio.Lock()
 progress_lock = asyncio.Lock()
+stats_lock = asyncio.Lock()
+
+STATS = {
+    "total": 0,
+    "processed": 0,
+    "success": 0,
+    "failed": 0,
+    "balance_gt_1": []
+}
+
+def parse_balance(balance_str):
+    try:
+        clean = "".join(c for c in balance_str if c.isdigit() or c == '.')
+        return float(clean)
+    except:
+        return 0.0
+
+async def log_progress():
+    async with stats_lock:
+        print(
+            f"\n[PROGRESS] {STATS['processed']}/{STATS['total']} | "
+            f"Success: {STATS['success']} | Failed: {STATS['failed']} | "
+            f"High Balances: {STATS['balance_gt_1']}",
+            flush=True
+        )
 
 # ================= PROGRESS =================
 def load_progress():
@@ -47,13 +72,8 @@ async def save_result(row):
             row["timestamp"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
             writer.writerow(row)
 
-# ================= CORE LOGIC =================
 # ================= POPUP HANDLING =================
 async def dismiss_overlays(page, username):
-    """
-    Dismiss overlays that may block clicks using JavaScript and known selectors.
-    """
-    # Overlays to remove via JS
     overlay_identifiers = [
         "strEchApp_ovrlay",
         "aviatrix-container_overlay",
@@ -66,159 +86,51 @@ async def dismiss_overlays(page, username):
 
     for identifier in overlay_identifiers:
         try:
-            await page.evaluate(f"""() => {{
-                // Remove by Class
-                const els = document.getElementsByClassName('{identifier}');
-                for (let i = els.length - 1; i >= 0; i--) els[i].remove();
-                
-                // Remove by ID
-                const el = document.getElementById('{identifier}');
-                if (el) el.remove();
-            }}""")
+            await page.evaluate(f"""
+                () => {{
+                    document.getElementById('{identifier}')?.remove();
+                    [...document.getElementsByClassName('{identifier}')].forEach(e => e.remove());
+                }}
+            """)
         except:
             pass
 
-    # Aggressive close button clicking
-    close_patterns = [
-        "button.animCLseBtn",
-        "button.mnPopupClose",
-        ".popup-close",
-        ".modal-close",
-        "button[aria-label='Close']",
-        "[class*='close']",
-        # Specifics from user code
-        "#app-next > div.mb-app > div.aviatrix-container_overlay:nth-of-type(22) > div.aviatrix-container > button.animCLseBtn:nth-of-type(1) > span",
-        "#app-next > div.mb-app:nth-of-type(1) > div.mainPopupWrpr.mainPopupWrpr_pgsoft:nth-of-type(20) > div.mnPopupCtntPar > button.mnPopupBtn.mnPopupClose.pgSoftClsBtn:nth-of-type(2)"
-    ]
-
-    for selector in close_patterns:
-        try:
-            # Try to click if visible, short timeout
-            loc = page.locator(selector).first
-            if await loc.is_visible():
-                await loc.click(timeout=5000000)
-                # print(f"[{username}] Closed popup: {selector}")
-                await asyncio.sleep(0.5)
-        except:
-            pass
-
+# ================= CORE =================
 async def process_account(browser, account, selectors):
     username = account["username"]
     password = account["password"]
 
-    context = await browser.new_context(
-        viewport={"width": 1920, "height": 1080},
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        java_script_enabled=True,
-        locale="en-US",
-    )
-    # Enhanced Stealth Injection
-    stealth_js = """
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-        window.navigator.chrome = { runtime: {} };
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications' ?
-            Promise.resolve({ state: 'denied' }) :
-            originalQuery(parameters)
-        );
-    """
-    await context.add_init_script(stealth_js)
-    
+    context = await browser.new_context(viewport={"width": 1920, "height": 1080})
     page = await context.new_page()
 
     try:
-        # Speed optimization
-        await page.route(
-            "**/*",
-            lambda route: route.abort()
-            if route.request.resource_type in ["image", "media", "font"]
-            else route.continue_(),
-        )
-
-        # 1. Navigate
-        await page.goto(selectors["website"], wait_until="domcontentloaded",timeout=6000000)
-        await asyncio.sleep(2)
-        
-        # 2. Cleanup before login click
+        await page.goto(selectors["website"], wait_until="domcontentloaded", timeout=6000000)
         await dismiss_overlays(page, username)
 
-        # 3. Click Login Button
-        try:
-            await page.click(selectors["landing_page_login_button"], timeout=6000000)
-        except:
-            # Fallback JS click
-            try:
-                await page.evaluate(f"document.querySelector('{selectors['landing_page_login_button']}').click()")
-            except:
-                pass
-        
-        await asyncio.sleep(1)
-        await dismiss_overlays(page, username)
-
-        # 4. Fill Credentials
+        await page.click(selectors["landing_page_login_button"], timeout=6000000)
         await page.fill(selectors["username_field"], username)
         await page.fill(selectors["password_field"], password)
         await page.press(selectors["password_field"], "Enter")
 
-        # 5. Wait for Login & Cleanup
-        try:
-            await page.wait_for_load_state("networkidle", timeout=6000000)
-        except:
-            pass
-            
-        await asyncio.sleep(2)
-        await dismiss_overlays(page, username) # Aggressive clean after login
+        await page.wait_for_load_state("networkidle", timeout=6000000)
 
-        # 6. Extract Balance
-        balance = "N/A"
-        try:
-            bal_loc = page.locator(selectors["avaliable_balance"])
-            await bal_loc.wait_for(state="visible", timeout=6000000)
-            
-            # Retry logic: Wait for actual number (not "LOADING...", "...", or empty)
-            # Retries up to 10 times (approx 10-15 seconds)
-            for _ in range(10):
-                text = (await bal_loc.inner_text()).strip()
-                
-                # Check if it has any digits (is a number-like string)
-                has_digits = any(char.isdigit() for char in text)
-                
-                if text and has_digits and "LOADING" not in text.upper() and "..." not in text:
-                    balance = text
-                    print("balance :" ,balance)
-                    break
-                
-                # If still loading, wait and try clearing popups again in case they obscure it
-                await asyncio.sleep(1.5)
-                await dismiss_overlays(page, username)
-        except:
-            pass
+        bal_loc = page.locator(selectors["avaliable_balance"])
+        await bal_loc.wait_for(state="visible", timeout=6000000)
 
-        os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
-        await page.screenshot(
-            path=os.path.join(SCREENSHOTS_DIR, f"{username}.png"),
-            full_page=True,
-        )
+        for _ in range(10):
+            text = (await bal_loc.inner_text()).strip()
+            if any(c.isdigit() for c in text):
+                print(f"[{username}] Balance detected: {text}", flush=True)
+                return {
+                    "username": username,
+                    "password": password,
+                    "balance": text,
+                    "status": "Success",
+                    "error": "",
+                }
+            await asyncio.sleep(1.5)
 
-        if balance != "N/A":
-            #print("No balance")
-            return {
-                "username": username,
-                "password": password,
-                "balance": balance,
-                "status": "Success",
-                "error": "",
-            }
-        else:
-             raise Exception("Balance not found or loading")
-
-    except Exception as e:
-        # Final cleanup attempt before error screenshot
-        await dismiss_overlays(page, username)
-        raise e # Re-raise to be caught by worker loop
+        raise Exception("Balance not found")
 
     finally:
         await context.close()
@@ -235,37 +147,26 @@ async def worker(worker_id, queue, browser, selectors):
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                print("Procsseing account : ",account)
+                print(f"[Worker {worker_id}] {username} | Attempt {attempt}", flush=True)
                 result = await process_account(browser, account, selectors)
 
-                if result["balance"]:
-                    await save_result(result)
-                    await save_progress(username)
-                    break
-                else:
-                    raise Exception("Empty balance")
+                await save_result(result)
+                await save_progress(username)
+
+                async with stats_lock:
+                    STATS["processed"] += 1
+                    STATS["success"] += 1
+
+                await log_progress()
+                break
 
             except Exception as e:
                 if attempt == MAX_RETRIES:
-                    await save_result({
-                        "username": username,
-                        "password": account["password"],
-                        "balance": "N/A",
-                        "status": "Failed",
-                        "error": str(e),
-                    })
-
-                    try:
-                        ctx = await browser.new_context()
-                        pg = await ctx.new_page()
-                        await pg.goto(selectors["website"], timeout=6000000)
-                        await pg.screenshot(
-                            path=os.path.join(SCREENSHOTS_DIR, f"{username}_ERROR.png")
-                        )
-                        await ctx.close()
-                    except:
-                        pass
-
+                    print(f"[FAILED] {username}: {e}", flush=True)
+                    async with stats_lock:
+                        STATS["processed"] += 1
+                        STATS["failed"] += 1
+                    await log_progress()
                 else:
                     await asyncio.sleep(2)
 
@@ -273,55 +174,25 @@ async def worker(worker_id, queue, browser, selectors):
 
 # ================= MAIN =================
 async def main():
-    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
-
     with open(SELECTORS_FILE, "r", encoding="utf-8") as f:
         selectors = json.load(f)
 
-    completed = load_progress()
+    accounts = list(csv.DictReader(open(ACCOUNTS_FILE)))
+    STATS["total"] = len(accounts)
 
-    accounts = []
-    if not os.path.exists(ACCOUNTS_FILE):
-        print(f"Error: {ACCOUNTS_FILE} not found.")
-        return
-
-    with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row["username"] and row["username"] not in completed:
-                accounts.append(row)
-
-    if not accounts:
-        print("Nothing left to process.")
-        return
+    print(f"Starting {STATS['total']} accounts", flush=True)
 
     queue = asyncio.Queue()
     for acc in accounts:
         queue.put_nowait(acc)
 
-    # Force headless in CI (GitHub Actions)
-    is_ci = os.getenv("GITHUB_ACTIONS") == "true"
-    use_headless = True if is_ci else False  # User defaults to False locally
-
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=use_headless,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-
-        workers = [
-            asyncio.create_task(worker(i, queue, browser, selectors))
-            for i in range(MAX_WORKERS)
-        ]
-
-        await asyncio.gather(*workers)
+        browser = await p.chromium.launch(headless=True)
+        tasks = [asyncio.create_task(worker(i, queue, browser, selectors)) for i in range(MAX_WORKERS)]
+        await asyncio.gather(*tasks)
         await browser.close()
 
-    print("All done.")
+    print("All done.", flush=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
