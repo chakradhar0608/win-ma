@@ -164,87 +164,100 @@ async def process_account(browser, account, selectors):
         await page.goto(selectors["website"], wait_until="domcontentloaded", timeout=60000)
         title = await page.title()
         print(f"[{username}] Page Title: {title}", flush=True)
+        if not page_title:
+            # If title is empty, we are blocked. Throw error to trigger retry.
+            raise Exception("BLOCKED: Generated empty page title.")
         # 3. Login
         print(f"[{username}] Logging in...", flush=True)
         # Attempt to dismiss pre-login popups
         await dismiss_overlays(page, username)
         
         try:
-            # Try specific selector first, but with a short timeout
-            await page.click(selectors["landing_page_login_button"], timeout=5000)
+            # OPTION 1: Try the specific class we saw in your logs, but ensure it's visible
+            # The logs showed the class "cls_login_btn" or "cls_login_content"
+            await page.click("a.loginBtn:visible, .cls_login_btn:visible, span:text('Login'):visible", timeout=5000)
         except:
-            # Fallback: Click any element that visually contains "Login"
-            print(f"[{username}] Standard selector failed, trying text match...")
-            await page.click("text=Login", timeout=5000)
+            print(f"[{username}] Primary login buttons not found/visible. Trying fallbacks...")
+            
+            # OPTION 2: Force click using JavaScript (bypasses visibility checks)
+            # This is dangerous but effective for "hidden" buttons
+            found = await page.evaluate("""() => {
+                const els = document.querySelectorAll('a, button, span, div');
+                for (const el of els) {
+                    if (el.innerText.trim() === 'Login' && el.offsetParent !== null) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            
+            if not found:
+                raise Exception("Could not find any clickable 'Login' button")
             
         await page.fill(selectors["username_field"], username)
         await page.fill(selectors["password_field"], password)
         await page.press(selectors["password_field"], "Enter")
 
         # 4. Wait for Page Load (Fixed 5s wait is safer than networkidle here)
-        print(f"[{username}] Login submitted. Waiting 10s for page to settle...", flush=True)
-        await asyncio.sleep(10)
+        # 4 & 5. OPTIMIZED: Smart Wait for Balance
+        print(f"[{username}] Login submitted. Waiting for balance...", flush=True)
+        
+        start_time = asyncio.get_event_loop().time()
+        timeout = 30  # Wait up to 30 seconds
+        balance_found = False
+        clean_text = "0.0"
 
-        # 5. SOLUTION 1: The "Ghost Read" Loop
-        # We try to read the text even if a popup is covering it.
-        print(f"[{username}] Attempting to read balance (Ghost Read)...", flush=True)
-        
-        bal_loc = page.locator(selectors["avaliable_balance"])
-        
-        # Try 10 times (approx 20 seconds)
-        for i in range(10):
+        while (asyncio.get_event_loop().time() - start_time) < timeout:
             try:
-                # OPTIONAL: Blind click to center of screen to close generic overlays
-                if i == 0: 
-                    try:
-                        await page.mouse.click(960, 540) # Center of 1920x1080
-                    except: pass
-
-                # Use text_content() because it works even if element is hidden/covered
+                # Get the text content (ignoring visibility)
+                bal_loc = page.locator(selectors["avaliable_balance"])
                 raw_text = await bal_loc.text_content(timeout=1000)
                 
                 if raw_text:
-                    clean_text = raw_text.strip()
-                    # Check if it looks like a number
-                    if any(c.isdigit() for c in clean_text):
-                        print(f"[{username}] SUCCESS: Balance found: {clean_text}", flush=True)
-                        return {
-                            "username": username,
-                            "password": password,
-                            "balance": clean_text,
-                            "status": "Success",
-                            "error": "",
-                        }
-            except Exception:
-                # Ignore minor errors during the loop
-                pass
-            
-            await asyncio.sleep(2)
+                    text = raw_text.strip()
+                    
+                    # === CRITICAL CHECK ===
+                    # 1. Must NOT contain "Loading..." (case-insensitive)
+                    # 2. Must contain at least one digit (0-9) to be a valid amount
+                    if "loading" not in text.lower() and any(c.isdigit() for c in text):
+                        # Use the text exactly as found (e.g., "₹ 0.00" or "₹ 120")
+                        clean_text = text
+                        balance_found = True
+                        print(f"[{username}] SUCCESS: Balance loaded: {clean_text}", flush=True)
+                        break
+            except:
+                pass # Ignore errors while page renders
 
-        # 6. SOLUTION 2: HTML Dump (If Ghost Read failed)
-        # If we reach here, we couldn't find the balance.
-        print(f"[{username}] FAILED: Balance not found. Dumping HTML for debugging...", flush=True)
+            await asyncio.sleep(0.5)
+
+        if balance_found:
+             return {
+                "username": username,
+                "password": password,
+                "balance": clean_text, # Returns "₹ 0.00" or "₹ 120"
+                "status": "Success",
+                "error": "",
+            }
+
+        # 6. Fallback: Dump HTML if we timed out
+        print(f"[{username}] FAILED: Stuck on '{clean_text}' or empty. Dumping HTML...", flush=True)
         
-        # Create output directories if they don't exist
         os.makedirs("debug_html", exist_ok=True)
         os.makedirs("screenshots", exist_ok=True)
-
-        # Save Screenshot
         await page.screenshot(path=f"screenshots/failed_{username}.png")
-        
-        # Save HTML Source Code (This helps you find the popup ID)
         html_content = await page.content()
         with open(f"debug_html/failed_{username}.html", "w", encoding="utf-8") as f:
             f.write(html_content)
 
-        raise Exception("Balance not found (Check debug_html folder)")
+        raise Exception(f"Balance not found (Last read: {clean_text})")
 
     except Exception as e:
-        # Re-raise the exception so the worker logs it as a failure
         raise e
 
     finally:
         await context.close()
+        
 
 # ================= WORKER =================
 async def worker(worker_id, queue, browser, selectors):
@@ -305,6 +318,7 @@ async def main():
         browser = await p.chromium.launch(
             headless=True,
             args=[
+                "--headless=new",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage", # Essential for Docker/CI environments
