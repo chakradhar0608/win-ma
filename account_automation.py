@@ -144,19 +144,20 @@ async def process_account(browser, account, selectors):
     page = await context.new_page()
 
     try:
-        await page.goto(selectors["website"], wait_until="domcontentloaded", timeout=6000000)
+        print(f"[{username}] Navigating...", flush=True)
+        await page.goto(selectors["website"], wait_until="domcontentloaded", timeout=60000)
         await dismiss_overlays(page, username)
-
-        await page.click(selectors["landing_page_login_button"], timeout=6000000)
+        print(f"[{username}] Logging in...", flush=True) # ADDED LOG
+        await page.click(selectors["landing_page_login_button"], timeout=60000)
         await page.fill(selectors["username_field"], username)
         await page.fill(selectors["password_field"], password)
         await page.press(selectors["password_field"], "Enter")
 
-        await page.wait_for_load_state("networkidle", timeout=6000000)
+        #await page.wait_for_load_state("networkidle", timeout=60000)
         
         await asyncio.sleep(2)
         await dismiss_overlays(page, username)
-
+        print(f"[{username}] Waiting for balance element...", flush=True)
         bal_loc = page.locator(selectors["avaliable_balance"])
         await bal_loc.wait_for(state="visible", timeout=6000000)
 
