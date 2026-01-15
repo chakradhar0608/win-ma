@@ -6,7 +6,7 @@ from datetime import datetime
 from playwright.async_api import async_playwright
 
 # ================= CONFIG =================
-MAX_WORKERS = 1
+MAX_WORKERS = 8
 MAX_RETRIES = 3
 
 ACCOUNTS_FILE = "accounts.csv"
