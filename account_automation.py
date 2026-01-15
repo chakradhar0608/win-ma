@@ -6,8 +6,8 @@ from datetime import datetime
 from playwright.async_api import async_playwright
 
 # ================= CONFIG =================
-MAX_WORKERS = 1
-MAX_RETRIES = 20
+MAX_WORKERS = 10
+MAX_RETRIES = 5
 
 ACCOUNTS_FILE = "accounts.csv"
 RESULTS_FILE = "account_balances.csv"
@@ -220,7 +220,7 @@ async def main():
         queue.put_nowait(acc)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        browser = await p.chromium.launch(headless=True)
         tasks = [asyncio.create_task(worker(i, queue, browser, selectors)) for i in range(MAX_WORKERS)]
         await asyncio.gather(*tasks)
         await browser.close()
