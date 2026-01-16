@@ -98,6 +98,7 @@ async def process_account(browser, account, selectors):
     username = account["username"]
     password = account["password"]
 
+    # 1. Setup Context with Desktop Viewport
     context = await browser.new_context(
         viewport={"width": 1920, "height": 1080},
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -120,67 +121,59 @@ async def process_account(browser, account, selectors):
         except:
             print(f"[{username}] Navigation timed out (continuing)...")
 
-        # 3. Login
-        # 3. Login
-        await dismiss_overlays(page, username)
+        # 3. Login - ROBUST METHOD
         print(f"[{username}] Logging in...", flush=True)
-        # Try to find a VISIBLE login button specifically
+        await dismiss_overlays(page, username)
+        
+        # Method A: Try specific button first
         try:
-            # Look for the specific header login button first
             if await page.locator(selectors["landing_page_login_button"]).is_visible():
-                await page.click(selectors["landing_page_login_button"], timeout=500000)
+                await page.click(selectors["landing_page_login_button"], timeout=5000)
             else:
-                # Fallback: Click the first 'Login' text that is actually visible
-                await page.click("text=Login >> visible=true", timeout=500000)
+                raise Exception("Primary button hidden")
         except:
-            # Emergency Fallback: If elements are hidden (mobile menu?), force a JS click
-            print(f"[{username}] Standard login click failed. Attempting JS force click...")
-            await page.evaluate(f"""() => {{
-                const btn = document.querySelector('{selectors["landing_page_login_button"]}');
-                if (btn) btn.click();
-            }}""")
+            # Method B: Click the first 'Login' text that is TRULY VISIBLE
+            # The '>> visible=true' part is critical here
+            print(f"[{username}] Primary button failed. Searching for visible text...")
+            try:
+                await page.click("text=Login >> visible=true", timeout=5000)
+            except:
+                # Method C: JS Force Click (Last Resort)
+                print(f"[{username}] JS Force Click...")
+                await page.evaluate(f"""() => {{
+                    const btn = document.querySelector('{selectors["landing_page_login_button"]}');
+                    if (btn) btn.click();
+                }}""")
 
-        # Wait for the login form (username field) to appear
+        # 4. Fill Credentials (FORCE MODE)
+        # We wait for the input to exist, then FORCE fill it to bypass "element not visible" errors
         try:
-            # Wait for the username input to be visible before typing
-            # This ensures the modal/popup has finished opening
-            await page.wait_for_selector(selectors["username_field"], state="visible", timeout=10000)
+            await page.wait_for_selector(selectors["username_field"], state="attached", timeout=10000)
+            await page.fill(selectors["username_field"], username, timeout=5000, force=True) # <--- FORCE ADDED
         except:
-            print(f"[{username}] Warning: Username field not visible yet.")
-
-        # 4. Fill Credentials
-        # Force-fill using JS if the element says "not visible" (common Playwright bug)
-        try:
-            await page.fill(selectors["username_field"], username, timeout=60000)
-        except:
+            # Fallback: JS Fill
              await page.evaluate(f"document.querySelector('{selectors['username_field']}').value = '{username}'")
              
-        await page.fill(selectors["password_field"], password)
+        await page.fill(selectors["password_field"], password, force=True)
         await page.press(selectors["password_field"], "Enter")
         
-        # Robust Login Click
-        
-
-        # 4. Smart Balance Wait (Replaces fixed 60s sleep)
+        # 5. Smart Balance Wait
         print(f"[{username}] Login submitted. Polling for balance...", flush=True)
         
         balance_found = False
         clean_text = "N/A"
         start_time = asyncio.get_event_loop().time()
         
-        # Loop for up to 60 seconds looking for balance
         while (asyncio.get_event_loop().time() - start_time) < 60:
             try:
-                # Close popups continuously while waiting
                 await dismiss_overlays(page, username)
                 
-                # Check balance
                 bal_loc = page.locator(selectors["avaliable_balance"])
-                raw_text = await bal_loc.text_content(timeout=5000)
+                # Use inner_text as it handles hidden text better
+                raw_text = await bal_loc.inner_text(timeout=2000)
                 
                 if raw_text:
                     text = raw_text.strip()
-                    # Success condition: Contains digits and NOT "Loading"
                     if any(c.isdigit() for c in text) and "loading" not in text.lower():
                         clean_text = text
                         print(f"[{username}] SUCCESS: Balance found: {clean_text}", flush=True)
@@ -188,10 +181,8 @@ async def process_account(browser, account, selectors):
                         break
             except: 
                 pass
-            
-            await asyncio.sleep(1) # Check every second
+            await asyncio.sleep(1)
 
-        # 5. Result Handling
         if balance_found:
              return {
                 "username": username,
@@ -201,8 +192,8 @@ async def process_account(browser, account, selectors):
                 "error": "",
             }
         else:
-            # Failure Dump
-            print(f"[{username}] FAILED: Balance not found. Dumping HTML...", flush=True)
+            print(f"[{username}] FAILED: Balance not found.", flush=True)
+            # Take screenshot to see what went wrong
             os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
             await page.screenshot(path=f"{SCREENSHOTS_DIR}/failed_{username}.png")
             raise Exception("Balance check timed out")
