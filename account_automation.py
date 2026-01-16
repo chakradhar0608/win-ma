@@ -148,6 +148,7 @@ async def process_account(browser, account, selectors):
         # Retry loop for finding the login button
         for i in range(30):
             await dismiss_overlays(page, username)
+            print(f"Trying for login :{i} th time")
             try:
                 # Priority 1: Standard Button
                 if await page.locator(selectors["landing_page_login_button"]).is_visible():
