@@ -43,7 +43,7 @@ jobs:
 
       - name: Create Accounts File
         # CRITICAL: Filename matches your Python config variable ACCOUNTS_FILE
-        run: echo "${{ secrets.ACCOUNTS_CSV }}" > ch_accounts_reversed.csv
+        run: echo "${{ secrets.ACCOUNTS_CSV }}" > accounts.csv
 
       - name: Install Playwright browsers
         if: steps.playwright-cache.outputs.cache-hit != 'true'
