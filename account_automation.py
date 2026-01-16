@@ -7,12 +7,12 @@ from datetime import datetime
 from playwright.async_api import async_playwright
 
 # ================= CONFIG =================
-MAX_WORKERS = 1  # Keep 1 per shard to avoid IP bans
+MAX_WORKERS = 1  # Keep 1 to prevent IP bans
 MAX_RETRIES = 2
 
 ACCOUNTS_FILE = "accounts.csv"
 RESULTS_FILE = "account_balances.csv"
-FAILED_FILE = "failed_accounts.csv"     # <--- NEW: Separate file for failures
+FAILED_FILE = "failed_accounts.csv"
 SELECTORS_FILE = "selectors.json"
 SCREENSHOTS_DIR = "screenshots"
 
@@ -35,7 +35,6 @@ async def log_progress():
               f"Success: {STATS['success']} | Failed: {STATS['failed']}", flush=True)
 
 async def save_result(row):
-    """Saves all attempts (Success and Failure) to the main log."""
     async with csv_lock:
         file_exists = os.path.exists(RESULTS_FILE)
         with open(RESULTS_FILE, "a", newline="", encoding="utf-8") as f:
@@ -45,14 +44,11 @@ async def save_result(row):
             writer.writerow(row)
 
 async def save_failed(row):
-    """Saves ONLY failed accounts to a separate CSV for easy retrying."""
     async with failed_lock:
         file_exists = os.path.exists(FAILED_FILE)
         with open(FAILED_FILE, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["username", "password", "error", "timestamp"])
             if not file_exists: writer.writeheader()
-            
-            # Simplified row for the failed file
             failed_row = {
                 "username": row["username"],
                 "password": row["password"],
@@ -63,7 +59,6 @@ async def save_failed(row):
 
 # ================= STEALTH & POPUPS =================
 async def apply_stealth(page):
-    """Manually hides bot signals."""
     await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         if (!window.chrome) { window.chrome = { runtime: {} }; }
@@ -80,20 +75,30 @@ async def apply_stealth(page):
 
 async def dismiss_overlays(page, username=""):
     """Aggressively closes popups."""
-    # 1. JS Removal
+    # 1. Escape Key
+    try: await page.keyboard.press("Escape")
+    except: pass
+
+    # 2. JS Removal
     try:
         await page.evaluate("""() => {
             const ids = ["strEchApp_ovrlay", "aviatrix-container_overlay", "mainPopupWrpr", "popup-overlay", "modal-overlay", "app-download-popup", "switchuser_riv"];
             ids.forEach(id => { const el = document.getElementById(id); if (el) el.remove(); });
-            const classes = ["modal-backdrop", "fade", "show", "overlay", "popup-container"];
-            classes.forEach(cls => { const els = document.getElementsByClassName(cls); for(let i=0; i<els.length; i++) els[i].remove(); });
+            const classes = ["modal-backdrop", "fade", "show", "overlay", "popup-container", "modal-content"];
+            classes.forEach(cls => { 
+                const els = document.getElementsByClassName(cls); 
+                for(let i=0; i<els.length; i++) {
+                    if (window.getComputedStyle(els[i]).zIndex > 999) els[i].remove();
+                } 
+            });
         }""")
     except: pass
 
-    # 2. Button Click
+    # 3. Click Close Buttons
     close_patterns = [
         "button.animCLseBtn", "button.mnPopupClose", ".popup-close", ".modal-close",
-        "button[aria-label='Close']", "[class*='close']", ".close-btn", ".pgSoftClsBtn"
+        "button[aria-label='Close']", "[class*='close']", ".close-btn", ".pgSoftClsBtn",
+        ".close", "i.fa-times", "svg[data-icon='close']", ".modal-header button"
     ]
     for selector in close_patterns:
         try:
@@ -102,19 +107,24 @@ async def dismiss_overlays(page, username=""):
                 await asyncio.sleep(0.2)
         except: pass
 
+    # 4. Handle "Download App" Popup
+    try:
+        if await page.locator("text=DOWNLOAD THE APP NOW").is_visible():
+            await page.locator("button.close, .close-icon").first.click(timeout=1000)
+    except: pass
+
 # ================= CORE LOGIC =================
 async def process_account(browser, account, selectors):
     username = account["username"]
     password = account["password"]
 
-    # 1. Setup Context (Desktop Viewport to avoid mobile menu hiding)
+    # 1. Setup Context
     context = await browser.new_context(
         viewport={"width": 1920, "height": 1080},
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         locale="en-IN"
     )
     
-    # Block heavy media
     await context.route("**/*", lambda route: route.abort() 
         if route.request.resource_type in ["image", "media", "font"] 
         else route.continue_())
@@ -130,49 +140,64 @@ async def process_account(browser, account, selectors):
         except:
             print(f"[{username}] Navigation timed out (continuing)...")
 
-        # 3. Login
+        # 3. Login with 30x Retry Loop
         print(f"[{username}] Logging in...", flush=True)
-        await dismiss_overlays(page, username)
+        login_successful = False
         
-        # Click Login Button (Robust)
-        try:
-            if await page.locator(selectors["landing_page_login_button"]).is_visible():
-                await page.click(selectors["landing_page_login_button"], timeout=5000)
-            else:
-                # Fallback: Search for visible text if ID is hidden
-                await page.click("text=Login >> visible=true", timeout=5000)
-        except:
-            # JS Fallback
-            print(f"[{username}] JS Force Click...")
-            await page.evaluate(f"""() => {{
-                const btn = document.querySelector('{selectors["landing_page_login_button"]}');
-                if (btn) btn.click();
-            }}""")
+        # Retry loop for finding the login button
+        for i in range(30):
+            await dismiss_overlays(page, username)
+            try:
+                # Priority 1: Standard Button
+                if await page.locator(selectors["landing_page_login_button"]).is_visible():
+                    await page.click(selectors["landing_page_login_button"], timeout=5000)
+                    login_successful = True
+                    break
+                # Priority 2: Text Match
+                elif await page.locator("text=Login >> visible=true").is_visible():
+                    await page.click("text=Login >> visible=true", timeout=5000)
+                    login_successful = True
+                    break
+            except:
+                pass # Ignore errors and retry
+            
+            # Wait 1s before retrying
+            await asyncio.sleep(1)
+
+        # Fallback: JS Force Click if loop failed
+        if not login_successful:
+            print(f"[{username}] Standard click failed. Attempting JS Force Click...", flush=True)
+            try:
+                await page.evaluate(f"""() => {{
+                    const btn = document.querySelector('{selectors["landing_page_login_button"]}');
+                    if (btn) btn.click();
+                }}""")
+            except: pass
 
         # 4. Fill Credentials (FORCE MODE)
         try:
             await page.wait_for_selector(selectors["username_field"], state="attached", timeout=10000)
-            await page.fill(selectors["username_field"], username, timeout=5000, force=True)
+            await page.fill(selectors["username_field"], username, timeout=50000, force=True)
         except:
              await page.evaluate(f"document.querySelector('{selectors['username_field']}').value = '{username}'")
              
         await page.fill(selectors["password_field"], password, force=True)
         await page.press(selectors["password_field"], "Enter")
 
-        # 5. Smart Balance Wait
+        # 5. Smart Balance Wait (240s Timeout)
         print(f"[{username}] Login submitted. Polling for balance...", flush=True)
         
         balance_found = False
         clean_text = "N/A"
         start_time = asyncio.get_event_loop().time()
         
-        while (asyncio.get_event_loop().time() - start_time) < 60:
+        while (asyncio.get_event_loop().time() - start_time) < 240:
             try:
                 await dismiss_overlays(page, username)
+                await asyncio.sleep(1) # Small pause for animations
                 
                 bal_loc = page.locator(selectors["avaliable_balance"])
-                # Use inner_text to get text even if slightly obscured
-                raw_text = await bal_loc.inner_text(timeout=2000)
+                raw_text = await bal_loc.inner_text(timeout=20000)
                 
                 if raw_text:
                     text = raw_text.strip()
@@ -210,51 +235,41 @@ async def worker(worker_id, queue, browser, selectors):
         account = await queue.get()
         username = account["username"]
         
-        # Random Delay (Important for Anti-Ban)
-        delay = random.uniform(2, 8)
+        delay = random.uniform(2, 5)
         print(f"[Worker {worker_id}] Sleeping {delay:.2f}s...", flush=True)
         await asyncio.sleep(delay)
 
-        success = False
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 print(f"[Worker {worker_id}] {username} | Attempt {attempt}", flush=True)
                 result = await process_account(browser, account, selectors)
                 
-                # Save Success
                 await save_result(result)
                 async with stats_lock:
                     STATS["processed"] += 1
                     STATS["success"] += 1
-                success = True
                 break
 
             except Exception as e:
                 err_msg = str(e)
-                print(f"[Worker {worker_id}] Error: {err_msg[:100]}")
-                
-                # Check for critical IP Block
                 if "BLOCKED" in err_msg or "403" in err_msg:
                     print("CRITICAL: IP seems blocked. Stopping worker.")
-                    # Log Failure
                     fail_data = {"username": username, "password": account["password"], "balance": "0", "status": "Blocked", "error": "IP BLOCKED"}
                     await save_result(fail_data)
-                    await save_failed(fail_data) # <--- Save to failed csv
+                    await save_failed(fail_data)
                     async with stats_lock: STATS["failed"] += 1
                     queue.task_done()
                     return
 
-                # If Max Retries reached
                 if attempt == MAX_RETRIES:
-                    # Log Failure
                     fail_data = {"username": username, "password": account["password"], "balance": "0", "status": "Failed", "error": err_msg}
                     await save_result(fail_data)
-                    await save_failed(fail_data) # <--- Save to failed csv
+                    await save_failed(fail_data)
                     async with stats_lock:
                         STATS["processed"] += 1
                         STATS["failed"] += 1
                 else:
-                    await asyncio.sleep(3) # Wait before retry
+                    await asyncio.sleep(3)
 
         await log_progress()
         queue.task_done()
@@ -267,20 +282,17 @@ async def main():
 
     with open(SELECTORS_FILE) as f: selectors = json.load(f)
     
-    # 1. Read Accounts
     if not os.path.exists(ACCOUNTS_FILE):
         print(f"Error: {ACCOUNTS_FILE} missing")
         return
     all_accounts = list(csv.DictReader(open(ACCOUNTS_FILE)))
     
-    # 2. Sharding Logic (For Matrix Strategy)
+    # Sharding Logic
     try:
         shard_index = int(os.getenv("SHARD_INDEX", 0))
         total_shards = int(os.getenv("TOTAL_SHARDS", 1))
     except:
-        shard_index = 0
-        total_shards = 1
-        
+        shard_index, total_shards = 0, 1
 
     total_accounts = len(all_accounts)
     if total_shards > 1:
@@ -302,7 +314,6 @@ async def main():
     queue = asyncio.Queue()
     for acc in my_accounts: queue.put_nowait(acc)
 
-    # 3. Detect CI Environment
     is_ci = os.getenv("GITHUB_ACTIONS") == "true"
     
     async with async_playwright() as p:
