@@ -7,18 +7,18 @@ from datetime import datetime
 from playwright.async_api import async_playwright
 
 # ================= CONFIG =================
-MAX_WORKERS = 1  # Keep 1 for CI to avoid IP bans
+MAX_WORKERS = 1  # Keep 1 per shard to avoid IP bans
 MAX_RETRIES = 2
 
 ACCOUNTS_FILE = "accounts.csv"
 RESULTS_FILE = "account_balances.csv"
-PROGRESS_FILE = "progress.json"
+FAILED_FILE = "failed_accounts.csv"     # <--- NEW: Separate file for failures
 SELECTORS_FILE = "selectors.json"
 SCREENSHOTS_DIR = "screenshots"
 
 # ================= GLOBALS =================
 csv_lock = asyncio.Lock()
-progress_lock = asyncio.Lock()
+failed_lock = asyncio.Lock()
 stats_lock = asyncio.Lock()
 
 STATS = {
@@ -35,6 +35,7 @@ async def log_progress():
               f"Success: {STATS['success']} | Failed: {STATS['failed']}", flush=True)
 
 async def save_result(row):
+    """Saves all attempts (Success and Failure) to the main log."""
     async with csv_lock:
         file_exists = os.path.exists(RESULTS_FILE)
         with open(RESULTS_FILE, "a", newline="", encoding="utf-8") as f:
@@ -43,18 +44,26 @@ async def save_result(row):
             row["timestamp"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
             writer.writerow(row)
 
-async def save_progress(username):
-    async with progress_lock:
-        if os.path.exists(PROGRESS_FILE):
-            with open(PROGRESS_FILE, "r") as f: completed = set(json.load(f))
-        else: completed = set()
-        
-        completed.add(username)
-        with open(PROGRESS_FILE, "w") as f: json.dump(sorted(list(completed)), f)
+async def save_failed(row):
+    """Saves ONLY failed accounts to a separate CSV for easy retrying."""
+    async with failed_lock:
+        file_exists = os.path.exists(FAILED_FILE)
+        with open(FAILED_FILE, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["username", "password", "error", "timestamp"])
+            if not file_exists: writer.writeheader()
+            
+            # Simplified row for the failed file
+            failed_row = {
+                "username": row["username"],
+                "password": row["password"],
+                "error": row["error"],
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            writer.writerow(failed_row)
 
 # ================= STEALTH & POPUPS =================
 async def apply_stealth(page):
-    """Manually hides bot signals for Headless Mode."""
+    """Manually hides bot signals."""
     await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         if (!window.chrome) { window.chrome = { runtime: {} }; }
@@ -69,7 +78,7 @@ async def apply_stealth(page):
         });
     """)
 
-async def dismiss_overlays(page, username):
+async def dismiss_overlays(page, username=""):
     """Aggressively closes popups."""
     # 1. JS Removal
     try:
@@ -98,7 +107,7 @@ async def process_account(browser, account, selectors):
     username = account["username"]
     password = account["password"]
 
-    # 1. Setup Context with Desktop Viewport
+    # 1. Setup Context (Desktop Viewport to avoid mobile menu hiding)
     context = await browser.new_context(
         viewport={"width": 1920, "height": 1080},
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -121,42 +130,35 @@ async def process_account(browser, account, selectors):
         except:
             print(f"[{username}] Navigation timed out (continuing)...")
 
-        # 3. Login - ROBUST METHOD
+        # 3. Login
         print(f"[{username}] Logging in...", flush=True)
         await dismiss_overlays(page, username)
         
-        # Method A: Try specific button first
+        # Click Login Button (Robust)
         try:
             if await page.locator(selectors["landing_page_login_button"]).is_visible():
                 await page.click(selectors["landing_page_login_button"], timeout=5000)
             else:
-                raise Exception("Primary button hidden")
-        except:
-            # Method B: Click the first 'Login' text that is TRULY VISIBLE
-            # The '>> visible=true' part is critical here
-            print(f"[{username}] Primary button failed. Searching for visible text...")
-            try:
+                # Fallback: Search for visible text if ID is hidden
                 await page.click("text=Login >> visible=true", timeout=5000)
-            except:
-                # Method C: JS Force Click (Last Resort)
-                print(f"[{username}] JS Force Click...")
-                await page.evaluate(f"""() => {{
-                    const btn = document.querySelector('{selectors["landing_page_login_button"]}');
-                    if (btn) btn.click();
-                }}""")
+        except:
+            # JS Fallback
+            print(f"[{username}] JS Force Click...")
+            await page.evaluate(f"""() => {{
+                const btn = document.querySelector('{selectors["landing_page_login_button"]}');
+                if (btn) btn.click();
+            }}""")
 
         # 4. Fill Credentials (FORCE MODE)
-        # We wait for the input to exist, then FORCE fill it to bypass "element not visible" errors
         try:
             await page.wait_for_selector(selectors["username_field"], state="attached", timeout=10000)
-            await page.fill(selectors["username_field"], username, timeout=5000, force=True) # <--- FORCE ADDED
+            await page.fill(selectors["username_field"], username, timeout=5000, force=True)
         except:
-            # Fallback: JS Fill
              await page.evaluate(f"document.querySelector('{selectors['username_field']}').value = '{username}'")
              
         await page.fill(selectors["password_field"], password, force=True)
         await page.press(selectors["password_field"], "Enter")
-        
+
         # 5. Smart Balance Wait
         print(f"[{username}] Login submitted. Polling for balance...", flush=True)
         
@@ -169,7 +171,7 @@ async def process_account(browser, account, selectors):
                 await dismiss_overlays(page, username)
                 
                 bal_loc = page.locator(selectors["avaliable_balance"])
-                # Use inner_text as it handles hidden text better
+                # Use inner_text to get text even if slightly obscured
                 raw_text = await bal_loc.inner_text(timeout=2000)
                 
                 if raw_text:
@@ -193,7 +195,6 @@ async def process_account(browser, account, selectors):
             }
         else:
             print(f"[{username}] FAILED: Balance not found.", flush=True)
-            # Take screenshot to see what went wrong
             os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
             await page.screenshot(path=f"{SCREENSHOTS_DIR}/failed_{username}.png")
             raise Exception("Balance check timed out")
@@ -205,37 +206,57 @@ async def process_account(browser, account, selectors):
 
 # ================= WORKER =================
 async def worker(worker_id, queue, browser, selectors):
-    while True:
-        try:
-            account = queue.get_nowait()
-        except asyncio.QueueEmpty:
-            return
-
+    while not queue.empty():
+        account = await queue.get()
         username = account["username"]
+        
+        # Random Delay (Important for Anti-Ban)
+        delay = random.uniform(2, 8)
+        print(f"[Worker {worker_id}] Sleeping {delay:.2f}s...", flush=True)
+        await asyncio.sleep(delay)
 
+        success = False
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 print(f"[Worker {worker_id}] {username} | Attempt {attempt}", flush=True)
                 result = await process_account(browser, account, selectors)
-                await save_result(result)
-                await save_progress(username)
                 
+                # Save Success
+                await save_result(result)
                 async with stats_lock:
                     STATS["processed"] += 1
                     STATS["success"] += 1
-                await log_progress()
+                success = True
                 break
 
             except Exception as e:
+                err_msg = str(e)
+                print(f"[Worker {worker_id}] Error: {err_msg[:100]}")
+                
+                # Check for critical IP Block
+                if "BLOCKED" in err_msg or "403" in err_msg:
+                    print("CRITICAL: IP seems blocked. Stopping worker.")
+                    # Log Failure
+                    fail_data = {"username": username, "password": account["password"], "balance": "0", "status": "Blocked", "error": "IP BLOCKED"}
+                    await save_result(fail_data)
+                    await save_failed(fail_data) # <--- Save to failed csv
+                    async with stats_lock: STATS["failed"] += 1
+                    queue.task_done()
+                    return
+
+                # If Max Retries reached
                 if attempt == MAX_RETRIES:
-                    print(f"[FAILED] {username}: {e}", flush=True)
+                    # Log Failure
+                    fail_data = {"username": username, "password": account["password"], "balance": "0", "status": "Failed", "error": err_msg}
+                    await save_result(fail_data)
+                    await save_failed(fail_data) # <--- Save to failed csv
                     async with stats_lock:
                         STATS["processed"] += 1
                         STATS["failed"] += 1
-                    await log_progress()
                 else:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(3) # Wait before retry
 
+        await log_progress()
         queue.task_done()
 
 # ================= MAIN =================
@@ -245,19 +266,48 @@ async def main():
         return
 
     with open(SELECTORS_FILE) as f: selectors = json.load(f)
-    accounts = list(csv.DictReader(open(ACCOUNTS_FILE)))
-    STATS["total"] = len(accounts)
+    
+    # 1. Read Accounts
+    if not os.path.exists(ACCOUNTS_FILE):
+        print(f"Error: {ACCOUNTS_FILE} missing")
+        return
+    all_accounts = list(csv.DictReader(open(ACCOUNTS_FILE)))
+    
+    # 2. Sharding Logic (For Matrix Strategy)
+    try:
+        shard_index = int(os.getenv("SHARD_INDEX", 0))
+        total_shards = int(os.getenv("TOTAL_SHARDS", 1))
+    except:
+        shard_index = 0
+        total_shards = 1
+        
 
+    total_accounts = len(all_accounts)
+    if total_shards > 1:
+        chunk_size = (total_accounts + total_shards - 1) // total_shards
+        start_idx = shard_index * chunk_size
+        end_idx = min(start_idx + chunk_size, total_accounts)
+        my_accounts = all_accounts[start_idx:end_idx]
+        print(f"--- SHARD {shard_index + 1}/{total_shards} ---")
+        print(f"Processing range: {start_idx} to {end_idx} (Count: {len(my_accounts)})")
+    else:
+        my_accounts = all_accounts
+        print(f"Processing all {len(my_accounts)} accounts")
+
+    if not my_accounts:
+        print("No accounts assigned to this shard.")
+        return
+
+    STATS["total"] = len(my_accounts)
     queue = asyncio.Queue()
-    for acc in accounts: queue.put_nowait(acc)
+    for acc in my_accounts: queue.put_nowait(acc)
 
-    # DETECT CI ENVIRONMENT
+    # 3. Detect CI Environment
     is_ci = os.getenv("GITHUB_ACTIONS") == "true"
     
     async with async_playwright() as p:
-        # Auto-switch Headless based on environment
         browser = await p.chromium.launch(
-            headless=True if is_ci else False,  # True in GitHub, False on laptop
+            headless=True if is_ci else False,
             args=[
                 "--no-sandbox", 
                 "--disable-setuid-sandbox",
