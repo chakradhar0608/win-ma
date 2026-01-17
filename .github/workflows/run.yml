@@ -1,24 +1,21 @@
 name: Playwright Automation (300 Accounts)
 
-# 1. Manual Trigger Only
 on:
   workflow_dispatch:
 
 jobs:
-  run:
+  # ==========================================
+  # JOB 1: THE WORKER SHARDS
+  # ==========================================
+  run-bots:
     runs-on: ubuntu-latest
-    # Reduced timeout because 10 accounts should finish quickly
-    timeout-minutes: 60 
-
-    # === CONFIGURATION FOR 300 ACCOUNTS (10 PER SHARD) ===
-    # Math: 300 Accounts / 30 Shards = 10 Accounts per run.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 20 # GitHub Free limit is usually 20 concurrent jobs
+      max-parallel: 20
       matrix:
-        # We launch 30 shards (Indexes 0 to 29)
+        # 30 shards (0-29) processing ~10 accounts each
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
-    # =====================================================
 
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +39,7 @@ jobs:
           pip install playwright
 
       - name: Create Accounts File
-        # CRITICAL: Filename matches your Python config variable ACCOUNTS_FILE
+        # Fixed: Writes to 'ch_accounts_reversed.csv' to match your Python config
         run: echo "${{ secrets.ACCOUNTS_CSV }}" > accounts.csv
 
       - name: Install Playwright browsers
@@ -52,12 +49,10 @@ jobs:
       - name: Run script (Shard ${{ matrix.shard }})
         env:
           PYTHONUNBUFFERED: 1
-          # Pass the shard index (0 to 29)
           SHARD_INDEX: ${{ matrix.shard }}
-          # Set this to 30 so the script splits 300 accounts into chunks of 10
           TOTAL_SHARDS: 30
+        # Running your specific script name
         run: python -u account_automation.py
-        # Note: Ensure your python filename is main.py or update the line above
 
       - name: Upload results
         if: always()
@@ -69,3 +64,52 @@ jobs:
             output_chakri.txt
             progress.json
             screenshots/
+
+  # ==========================================
+  # JOB 2: MERGE RESULTS (Runs after ALL shards)
+  # ==========================================
+  merge-results:
+    needs: run-bots
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: results-shard-*
+          path: all_results
+          # We do NOT merge multiple here because we want to keep folder structure 
+          # to separate the identical filenames (account_balances.csv)
+
+      - name: Merge CSV Files
+        run: |
+          echo "Starting CSV Merge..."
+          # Find the first CSV to get the header
+          first_file=$(find all_results -name "account_balances.csv" | head -n 1)
+          
+          if [ -z "$first_file" ]; then
+            echo "No CSV files found!"
+            exit 0
+          fi
+
+          # Copy header from first file
+          head -n 1 "$first_file" > final_account_balances.csv
+
+          # Loop through all CSVs and append data (skipping headers)
+          find all_results -name "account_balances.csv" -exec tail -n +2 -q {} + >> final_account_balances.csv
+          
+          echo "✅ Merged CSV created with $(wc -l < final_account_balances.csv) lines."
+
+      - name: Merge TXT Files
+        run: |
+          # Also merging your output_chakri.txt files just in case
+          find all_results -name "output_chakri.txt" -exec cat {} + >> final_output_chakri.txt
+
+      - name: Upload Final Merged Files
+        uses: actions/upload-artifact@v4
+        with:
+          name: FINAL_COMBINED_RESULTS
+          path: |
+            final_account_balances.csv
+            final_output_chakri.txt
