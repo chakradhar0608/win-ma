@@ -11,13 +11,13 @@ MAX_RETRIES = 2
 
 ACCOUNTS_FILE = "accounts.csv"
 RESULTS_FILE = "account_balances.csv"
-FAILED_FILE = "failed_accounts.csv"  # <--- NEW: Required for GitHub Workflow
+FAILED_FILE = "failed_accounts.csv"
 PROGRESS_FILE = "progress.json"
 SCREENSHOTS_DIR = "screenshots"
 SELECTORS_FILE = "selectors.json"
 
 csv_lock = asyncio.Lock()
-failed_lock = asyncio.Lock() # <--- NEW: Lock for failed file
+failed_lock = asyncio.Lock()
 progress_lock = asyncio.Lock()
 
 # ================= PROGRESS =================
@@ -152,7 +152,6 @@ async def click_all_close_buttons(page, username):
 
 async def aggressive_popup_cleanup(page, username, rounds=3):
     try:
-        
         for round_num in range(rounds):
             if page.is_closed(): return
             await nuclear_popup_removal(page, username)
@@ -211,9 +210,9 @@ async def process_account(browser, account, selectors):
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": '"Windows"',
         },
-        timezone_id="Asia/Kolkata",  # 2. Set Timezone to IST
-        geolocation={"latitude": 17.3850, "longitude": 78.4867}, # 3. Set GPS (Hyderabad)
-        permissions=["geolocation"]  # Allow site to see the fake location
+        timezone_id="Asia/Kolkata",
+        geolocation={"latitude": 17.3850, "longitude": 78.4867},
+        permissions=["geolocation"]
     )
     
     stealth_js = """
@@ -232,59 +231,135 @@ async def process_account(browser, account, selectors):
         await page.route(
             "**/*",
             lambda route: route.abort()
-            if route.request.resource_type in ["image", "media", "font", "other"]
+            if route.request.resource_type in ["image", "media", "font", "stylesheet", "other"]
             or any(x in route.request.url for x in ["google-analytics", "facebook", "gtm.js", "fbevents", "ads", "tracker"])
             else route.continue_(),
         )
 
         print(f"[{username}] 🌐 Navigating...", flush=True)
         try:
-            await page.goto(selectors["website"], timeout=900000)
+            await page.goto(selectors["website"], timeout=90000)
         except:
             print(f"[{username}] ⚠️ Navigation timed out (continuing)...", flush=True)
 
-        # --- CRITICAL: CHECK FOR 403 BLOCKED ---
+        # Check for 403 BLOCKED
         try:
             title = await page.title()
-            print("page title :",title)
+            print(f"[{username}] Page title: {title}", flush=True)
             content = await page.content()
             if "403 Forbidden" in title or "Access Denied" in content or "403 Forbidden" in content:
                 print(f"[{username}] ⛔ 403 BLOCKED DETECTED! Aborting.", flush=True)
                 raise Exception("BLOCKED: 403 Forbidden")
         except Exception as e:
             if "BLOCKED" in str(e): raise e
+        
         await asyncio.sleep(2)
         await aggressive_popup_cleanup(page, username, rounds=2)
 
-        print(f"[{username}] 🔑 Clicking login...", flush=True)
+        print(f"[{username}] 🔑 Clicking landing page login...", flush=True)
         try:
             await page.click(selectors["landing_page_login_button"], timeout=60000)
         except:
-            try: await page.evaluate(f"document.querySelector('{selectors['landing_page_login_button']}').click()")
-            except: print(f"[{username}] ⚠️ Login button click failed", flush=True)
+            try: 
+                await page.evaluate(f"document.querySelector('{selectors['landing_page_login_button']}').click()")
+            except: 
+                print(f"[{username}] ⚠️ Landing page login button click failed", flush=True)
         
         await asyncio.sleep(1)
 
+        # ===== IMPROVED LOGIN SUBMISSION =====
         print(f"[{username}] ✍️ Filling credentials...", flush=True)
-        await page.fill(selectors["username_field"], username,timeout=600000)
-        await page.fill(selectors["password_field"], password,timeout=600000)
-        await page.press(selectors["password_field"], "Enter")
+        await page.fill(selectors["username_field"], username, timeout=60000)
+        await page.fill(selectors["password_field"], password, timeout=60000)
         
-        print(f"[{username}] ⏳ Waiting for login...", flush=True)
-        #try: await page.wait_for_load_state(timeout=600000)
-        #except: await asyncio.sleep(3)
+        print(f"[{username}] 🔐 Submitting login...", flush=True)
+        submission_success = False
         
-        otp=False
-        for i in range(200):
-            print(f"[{username}]Trying {i} th time URL :{page.url}" )
-            await asyncio.sleep(1)
-            if "?uid=" in page.url:
-                otp=True
+        # Method 1: Click #loginbutton (most reliable)
+        try:
+            await page.click("#loginbutton", timeout=5000)
+            submission_success = True
+            print(f"[{username}] ✓ Clicked login button", flush=True)
+        except Exception as e:
+            print(f"[{username}] ⚠️ Login button click failed: {str(e)[:50]}", flush=True)
+            
+            # Fallback 1: Force click
+            try:
+                await page.locator("#loginbutton").click(force=True, timeout=3000)
+                submission_success = True
+                print(f"[{username}] ✓ Force-clicked login button", flush=True)
+            except:
+                pass
+        
+        # Method 2: Press Enter on password field (backup)
+        if not submission_success:
+            try:
+                await page.press(selectors["password_field"], "Enter")
+                print(f"[{username}] ✓ Pressed Enter", flush=True)
+                submission_success = True
+            except Exception as e:
+                print(f"[{username}] ⚠️ Enter press failed: {str(e)[:50]}", flush=True)
+        
+        # Method 3: JavaScript form submission (last resort)
+        if not submission_success:
+            try:
+                await page.evaluate("""
+                    const loginBtn = document.querySelector('#loginbutton');
+                    if (loginBtn) {
+                        loginBtn.click();
+                    } else {
+                        const form = document.querySelector('form');
+                        if (form) form.submit();
+                        else {
+                            const submitBtn = document.querySelector('button[type="submit"]');
+                            if (submitBtn) submitBtn.click();
+                        }
+                    }
+                """)
+                print(f"[{username}] ✓ JS form submit", flush=True)
+            except Exception as e:
+                print(f"[{username}] ⚠️ JS submit failed: {str(e)[:50]}", flush=True)
+        
+        print(f"[{username}] ⏳ Waiting for login redirect...", flush=True)
+        
+        # Wait for URL change or network idle
+        otp = False
+        try:
+            # Wait for navigation to complete (max 120 seconds)
+            await page.wait_for_url("**/?uid=*", timeout=120000)
+            otp = True
+            print(f"[{username}] 🚀 Redirected successfully!", flush=True)
+        except Exception as e:
+            # Fallback: Check URL periodically (reduced to 60 iterations)
+            print(f"[{username}] ⏳ URL pattern not detected, checking manually...", flush=True)
+            for i in range(60):
+                current_url = page.url
+                print(f"[{username}] Attempt {i+1}/60 - URL: {current_url}", flush=True)
                 
-                print(f"[{username}] 🚀 Redirected successfully!", flush=True)
-                break
+                if "?uid=" in current_url:
+                    otp = True
+                    print(f"[{username}] 🚀 Redirected successfully!", flush=True)
+                    break
+                
+                # Check for login errors
+                try:
+                    error_selectors = [
+                        "text=Invalid credentials",
+                        "text=Wrong password",
+                        "text=Login failed",
+                        ".error-message",
+                        ".login-error"
+                    ]
+                    for err_sel in error_selectors:
+                        if await page.locator(err_sel).is_visible(timeout=100):
+                            raise Exception("Login credentials rejected")
+                except:
+                    pass
+                
+                await asyncio.sleep(1)
+        
         if not otp:
-            raise Exception("OTP required - account skipped")
+            raise Exception("Login failed - no redirect after 60 seconds")
 
         print(f"[{username}] 🧹 Post-login cleanup...", flush=True)
         await aggressive_popup_cleanup(page, username, rounds=4)
@@ -301,12 +376,13 @@ async def process_account(browser, account, selectors):
                 
                 bal_loc = page.locator(selectors["avaliable_balance"])
                 if await bal_loc.is_visible():
-                    text = (await bal_loc.inner_text(timeout=100000)).strip()
+                    text = (await bal_loc.inner_text(timeout=10000)).strip()
                     if text and any(c.isdigit() for c in text) and "LOADING" not in text.upper():
                         balance = text
                         print(f"[{username}] ✅ Balance found: {balance}", flush=True)
                         break
-            except: pass
+            except: 
+                pass
             await asyncio.sleep(1.5)
         
         os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
@@ -348,7 +424,6 @@ async def worker(worker_id, queue, browser, selectors):
                 if attempt == MAX_RETRIES:
                     print(f"[Worker {worker_id}] ❌ FAILED: {username}", flush=True)
                     
-                    # 1. Log to MAIN CSV (for general tracking)
                     fail_data = {
                         "username": username,
                         "password": account["password"],
@@ -357,9 +432,7 @@ async def worker(worker_id, queue, browser, selectors):
                         "error": str(e),
                     }
                     await save_result(fail_data)
-                    
-                    # 2. Log to FAILED CSV (Required by workflow)
-                    await save_failed(fail_data) 
+                    await save_failed(fail_data)
 
                     try:
                         ctx = await browser.new_context()
@@ -367,7 +440,8 @@ async def worker(worker_id, queue, browser, selectors):
                         await pg.goto(selectors["website"], timeout=30000)
                         await pg.screenshot(path=os.path.join(SCREENSHOTS_DIR, f"{username}_ERROR.png"))
                         await ctx.close()
-                    except: pass
+                    except: 
+                        pass
                 else:
                     await asyncio.sleep(2)
         queue.task_done()
@@ -381,7 +455,7 @@ async def main():
     with open(SELECTORS_FILE, "r", encoding="utf-8") as f:
         selectors = json.load(f)
 
-    # 1. READ ACCOUNTS
+    # READ ACCOUNTS
     all_accounts = []
     if not os.path.exists(ACCOUNTS_FILE):
         print(f"Error: {ACCOUNTS_FILE} not found.")
@@ -392,7 +466,7 @@ async def main():
             if row["username"]:
                 all_accounts.append(row)
 
-    # 2. SHARDING LOGIC
+    # SHARDING LOGIC
     try:
         shard_index = int(os.getenv("SHARD_INDEX", 0))
         total_shards = int(os.getenv("TOTAL_SHARDS", 1))
@@ -412,7 +486,7 @@ async def main():
         my_accounts_raw = all_accounts
         print(f"Processing all {len(my_accounts_raw)} accounts")
 
-    # 3. FILTER COMPLETED
+    # FILTER COMPLETED
     completed = load_progress()
     accounts = [acc for acc in my_accounts_raw if acc["username"] not in completed]
 
@@ -421,7 +495,8 @@ async def main():
         return
 
     queue = asyncio.Queue()
-    for acc in accounts: queue.put_nowait(acc)
+    for acc in accounts: 
+        queue.put_nowait(acc)
 
     is_ci = os.getenv("GITHUB_ACTIONS") == "true"
     use_headless = True if is_ci else False
